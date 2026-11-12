@@ -1,7 +1,6 @@
 """
-ants.py - Ant colony simulation driven by coarse-grid navigation flow fields.
-Features purposeful state machines for Foragers, Excavators, Nurses, and Soldiers,
-surface ground-hugging, social greetings, and natural rest cycles.
+ants.py - Ant colony simulation with centerline flow-field navigation,
+clean single-authority movement, frame-tick dt units, and guaranteed excavation.
 """
 
 import math
@@ -105,7 +104,7 @@ class Brood:
         if self.carried:
             return
 
-        self.age += dt * 0.05
+        self.age += dt * 0.015 # tick based growth
         if self.stage == self.STAGE_EGG:
             if self.age > 18.0:
                 self.stage = self.STAGE_LARVA
@@ -152,25 +151,28 @@ class Ant:
         self.health = 100.0
         self.alive = True
 
-        # Initial state setup
+        # Total distance traveled tracker
+        self.distance_traveled = 0.0
+
+        # Morphology & speed per caste (speed in pixels per unit dt)
         if caste == CASTE_QUEEN:
             self.state = "Ruling / Laying Eggs"
             self.length = 20.0
             self.width = 7.0
-            self.speed = 0.6
+            self.speed = 0.55
             self.base_color = (70, 30, 20)
             self.head_color = (60, 25, 15)
         elif caste == CASTE_SOLDIER:
             self.state = STATE_PATROLLING
             self.length = 14.0
             self.width = 5.0
-            self.speed = 1.35
+            self.speed = 1.3
             self.base_color = (95, 45, 25)
             self.head_color = (135, 42, 22)
         else: # WORKER
             self.length = 10.0
             self.width = 3.5
-            self.speed = 1.6
+            self.speed = 1.55
             self.base_color = (75, 40, 25)
             self.head_color = (65, 32, 20)
             if subrole == SUBROLE_FORAGER:
@@ -180,39 +182,39 @@ class Ant:
             else: # Nurse
                 self.state = STATE_NURSING
 
-        # Navigation and behavior timers
+        # Timers (all calibrated to frame-tick dt units where 30 dt = 1 sec)
         self.walk_phase = random.uniform(0, 10.0)
         self.pheromone_timer = 0.0
         self.target_threat = None
         self.greeting_timer = 0.0
-        self.greeting_cooldown = random.uniform(5.0, 15.0)
+        self.greeting_cooldown = random.uniform(100.0, 300.0)
         self.rest_timer = 0.0
 
-        # Excavator specifics
-        self.dig_streak = 0
-        self.dig_angle = 0.0
-        self.dig_target = (640, 460)
+        # Excavator variables
+        self.dig_bites_remaining = 0
+        self.dig_bite_timer = 0.0
+        self.dig_target = (640, 465)
 
-        # Forager surface direction
+        # Forager surface direction (1 = right, -1 = left)
         self.surface_dir = 1 if random.random() < 0.5 else -1
 
     def update(self, dt, world, pheromones, spatial_hash, colony):
         if not self.alive:
             return
 
-        self.walk_phase += self.speed * 0.35 * dt
+        self.walk_phase += self.speed * 0.25 * dt
 
-        # Energy consumption
-        self.energy = max(0.0, self.energy - 0.03 * dt)
+        # Energy consumption (drains over ~2000 ticks)
+        self.energy = max(0.0, self.energy - 0.015 * dt)
 
-        # Greeting timer & cooldown countdown
+        # Greeting countdown
         if self.greeting_cooldown > 0:
             self.greeting_cooldown -= dt
 
         if self.greeting_timer > 0:
             self.greeting_timer -= dt
-            # Wiggle antennae during greeting; do not move
-            self.walk_phase += 0.5 * dt
+            # Wiggle antennae during greeting; do not translate
+            self.walk_phase += 0.4 * dt
             return
 
         # Queen behavior
@@ -224,9 +226,8 @@ class Ant:
         # Rest state logic
         if self.state == STATE_RESTING:
             self.rest_timer -= dt
-            self.energy = min(100.0, self.energy + 18.0 * dt)
+            self.energy = min(100.0, self.energy + 0.8 * dt)
             if self.rest_timer <= 0:
-                # Return to primary duties
                 if self.subrole == SUBROLE_FORAGER:
                     self.state = STATE_EXITING_NEST
                 elif self.subrole == SUBROLE_EXCAVATOR:
@@ -235,55 +236,54 @@ class Ant:
                     self.state = STATE_NURSING
             return
 
-        # Check fatigue (workers need brief rest when energy drops)
-        if self.caste == CASTE_WORKER and self.cargo == CARGO_NONE and self.energy < 12.0:
+        # Check fatigue (workers rest when energy drops below 10)
+        if self.caste == CASTE_WORKER and self.cargo == CARGO_NONE and self.energy < 10.0:
             self.state = STATE_RESTING
-            self.rest_timer = random.uniform(3.5, 6.0)
+            self.rest_timer = 120.0 # 4 seconds rest
             return
 
-        # Pheromone emission timer
+        # Pheromone emission timer (every 30 ticks = 1 second)
         self.pheromone_timer += dt
-        if self.pheromone_timer >= 1.0:
+        if self.pheromone_timer >= 30.0:
             self.pheromone_timer = 0.0
             if self.cargo == CARGO_FOOD:
-                # Lay strong FOOD pheromones back to nest
-                pheromones.deposit(self.x, self.y, layer_idx=1, amount=22.0, radius=2)
+                # Strong FOOD pheromone trail
+                pheromones.deposit(self.x, self.y, layer_idx=1, amount=25.0, radius=2)
             elif self.y > SURFACE_Y:
-                # Lay faint HOME pheromones along tunnels
+                # Faint HOME trail in tunnels
                 pheromones.deposit(self.x, self.y, layer_idx=0, amount=8.0, radius=1)
 
-        # Caste dispatch
+        # Caste state dispatch
         if self.caste == CASTE_SOLDIER:
             self._update_soldier(dt, world, pheromones, colony)
         else:
             self._update_worker(dt, world, pheromones, colony)
 
-        # Physics stepping & surface ground-hugging
+        # Single-authority movement stepping
         self._step_movement(dt, world)
 
     def _update_queen(self, dt, world, colony):
-        """Queen resides in the royal chamber, slowly laying eggs when fed."""
+        """Queen rests in royal chamber and produces eggs when food is available."""
         self.state = "Ruling / Laying Eggs"
         rx, ry = world.royal_chamber_pos
         dx = rx - self.x
         dy = ry - self.y
         dist = math.hypot(dx, dy)
-        if dist > 26:
+        if dist > 24:
             self.target_angle = math.atan2(dy, dx)
         else:
-            if random.random() < 0.02:
+            if random.random() < 0.015:
                 self.target_angle = random.uniform(0, math.pi * 2)
 
-        # Egg production
-        colony.queen_egg_timer += dt * 0.03
-        if colony.food_stockpile > 0 and colony.queen_egg_timer > 9.0:
+        # Egg production every 250 ticks (~8.3s) if food available
+        colony.queen_egg_timer += dt
+        if colony.food_stockpile > 0 and colony.queen_egg_timer >= 250.0:
             colony.queen_egg_timer = 0.0
             colony.food_stockpile = max(0, colony.food_stockpile - 1)
             colony.spawn_brood(self.x + random.uniform(-8, 8), self.y + random.uniform(-4, 4), Brood.STAGE_EGG)
 
     def _update_soldier(self, dt, world, pheromones, colony):
         """Soldier patrols entrance and intercepts threats with fierce combat."""
-        # 1. Threat search within 140px
         closest_threat = None
         min_dist = 140.0
         for threat in colony.threats:
@@ -298,7 +298,7 @@ class Ant:
             self.target_threat = closest_threat
             self.target_angle = math.atan2(closest_threat.y - self.y, closest_threat.x - self.x)
             if min_dist < 12.0:
-                closest_threat.take_damage(1.4 * dt, world)
+                closest_threat.take_damage(1.5 * dt, world)
                 self.x += random.uniform(-0.5, 0.5)
             return
 
@@ -311,11 +311,10 @@ class Ant:
             self.target_angle += bias * 0.6
         else:
             # Patrol upper tunnel and surface entrance using flow field
-            if self.y > 340:
+            if self.y > 320:
                 vx, vy, _ = world.get_flow_direction(self.x, self.y, "surface")
                 self.target_angle = math.atan2(vy, vx)
             elif self.y <= SURFACE_Y + 4:
-                # Walk across surface entrance crater
                 if random.random() < 0.02:
                     self.surface_dir = -self.surface_dir
                 self.target_angle = 0.0 if self.surface_dir > 0 else math.pi
@@ -337,22 +336,24 @@ class Ant:
             surf_y = world.get_surface_y(self.x)
 
             if self.y <= surf_y + 4:
-                # On surface: head horizontally toward entrance crater (x=640)
+                # On surface: head toward entrance crater (x=640)
                 entrance_x = world.width // 2
                 dx = entrance_x - self.x
-                if abs(dx) > 16:
+                if abs(dx) > 10:
                     self.target_angle = 0.0 if dx > 0 else math.pi
                 else:
-                    # Over entrance: dive down into tunnel
+                    # Within 10px of entrance: dive down into tunnel
                     self.target_angle = math.pi / 2
                 return
             else:
-                # Inside tunnels: follow flow field to pantry!
+                # Inside tunnels: follow flow field to pantry
                 vx, vy, dist = world.get_flow_direction(self.x, self.y, "pantry")
-                if dist < 18:
-                    # Reached pantry! Store food crumb
+                px, py = world.food_storage_pos
+                if dist < 24 or math.hypot(px - self.x, py - self.y) < 28:
+                    # Reached pantry! Store food
                     self.cargo = CARGO_NONE
                     colony.food_stockpile += 1
+                    colony.total_food_delivered += 1
                     self.energy = 100.0
                     self.state = STATE_EXITING_NEST
                     return
@@ -360,24 +361,19 @@ class Ant:
                     self.target_angle = math.atan2(vy, vx)
                 return
 
-        # 2. Exiting nest toward surface
-        if self.state == STATE_EXITING_NEST:
-            surf_y = world.get_surface_y(self.x)
-            if self.y <= surf_y + 4:
-                # Successfully reached surface! Start surface foraging
-                self.state = STATE_SURFACE_FORAGING
-                self.surface_dir = 1 if random.random() < 0.5 else -1
-                return
-            else:
-                vx, vy, _ = world.get_flow_direction(self.x, self.y, "surface")
-                self.target_angle = math.atan2(vy, vx)
-                return
+        # 2. Exiting nest toward surface (if underground and unladen)
+        surf_y = world.get_surface_y(self.x)
+        if self.y > surf_y + 4:
+            self.state = STATE_EXITING_NEST
+            vx, vy, _ = world.get_flow_direction(self.x, self.y, "surface")
+            self.target_angle = math.atan2(vy, vx)
+            return
 
-        # 3. Surface foraging
+        # 3. Surface foraging (self.y <= surf_y + 4)
         self.state = STATE_SURFACE_FORAGING
         # Check nearby food items
         for food in world.food_items:
-            if food.amount > 0 and math.hypot(food.x - self.x, food.y - self.y) < 18:
+            if food.amount > 0 and math.hypot(food.x - self.x, food.y - self.y) < 26:
                 food.amount -= 1
                 self.cargo = CARGO_FOOD
                 self.state = STATE_RETURNING_FOOD
@@ -387,9 +383,8 @@ class Ant:
         # Follow FOOD pheromone trail on surface if present
         f_bias, f_mag = pheromones.sense_forward(self.x, self.y, self.angle, layer_idx=1, dist=18.0)
         if f_mag > 0.1:
-            self.target_angle += f_bias * 0.45
+            self.target_angle += f_bias * 0.4
         else:
-            # Patrol along grass line
             if self.x < 45:
                 self.surface_dir = 1
             elif self.x > world.width - 45:
@@ -400,7 +395,7 @@ class Ant:
             self.target_angle = 0.0 if self.surface_dir > 0 else math.pi
 
     def _update_excavator(self, dt, world, pheromones, colony):
-        """Excavator: Uses flow field to reach dig sites, carves 8-14 bites, hauls dirt to mound."""
+        """Excavator: Uses flow field to reach dig sites, carves 10 bites, hauls dirt to mound."""
         # 1. Hauling excavated dirt to surface mound
         if self.cargo == CARGO_DIRT:
             self.state = STATE_HAULING_DIRT
@@ -408,8 +403,8 @@ class Ant:
             entrance_x = world.width // 2
 
             if self.y <= surf_y + 4:
-                # On surface! Walk 15-45px left or right onto anthill mound
-                mound_target_x = entrance_x + (30 if self.surface_dir > 0 else -30)
+                # On surface! Walk 18-45px left or right onto anthill mound
+                mound_target_x = entrance_x + (32 if self.surface_dir > 0 else -32)
                 dx = mound_target_x - self.x
 
                 if abs(dx) > 10:
@@ -417,61 +412,72 @@ class Ant:
                 else:
                     # Deposit dirt pellet onto mound slopes
                     world.fill_pixel(self.x, surf_y, 6) # CELL_MOUND
-                    world.fill_pixel(self.x, surf_y - 1, 6) # Build mound height
+                    world.fill_pixel(self.x, surf_y - 1, 6) # Mound height
                     self.cargo = CARGO_NONE
-                    self.dig_target = world.get_expansion_target()
+                    self.dig_target = world.get_active_dig_target()
                     self.state = STATE_GOING_TO_DIG
                     self.surface_dir = -self.surface_dir
                     return
             else:
-                # Follow flow field to surface entrance
                 vx, vy, _ = world.get_flow_direction(self.x, self.y, "surface")
                 self.target_angle = math.atan2(vy, vx)
             return
 
-        # 2. Executing an active digging streak (8 to 14 bites)
-        if self.dig_streak > 0:
+        # 2. Executing an active digging streak (10 bites, 1 bite every 3 ticks)
+        if self.state == STATE_DIGGING or self.dig_bites_remaining > 0:
             self.state = STATE_DIGGING
-            self.target_angle = self.dig_angle
+            self.dig_bite_timer += dt
 
-            # Carve bite ahead
-            bite_x = self.x + math.cos(self.dig_angle) * 7.0
-            bite_y = self.y + math.sin(self.dig_angle) * 7.0
+            # Stop moving translationally while biting dirt
+            tx, ty = self.dig_target
+            self.target_angle = math.atan2(ty - self.y, tx - self.x) if math.hypot(tx - self.x, ty - self.y) > 5 else self.angle
 
-            if world.get_cell(bite_x, bite_y) != 5: # Not bedrock
-                world.carve_circle(bite_x, bite_y, radius=6, play_effects=True)
-                self.dig_streak -= 1
-                self.dig_angle += random.uniform(-0.08, 0.08)
-                if self.dig_streak <= 0:
+            if self.dig_bite_timer >= 3.0:
+                self.dig_bite_timer = 0.0
+                bite_x = self.x + math.cos(self.target_angle) * 7.0
+                bite_y = self.y + math.sin(self.target_angle) * 7.0
+
+                if world.get_cell(bite_x, bite_y) != 5: # Not bedrock
+                    world.carve_circle(bite_x, bite_y, radius=7, play_effects=True)
+                    self.dig_bites_remaining -= 1
+                    # Spawn dirt particles
+                    world.add_falling_dirt(bite_x, bite_y)
+                else:
+                    self.dig_bites_remaining = 0
+
+                if self.dig_bites_remaining <= 0:
                     self.cargo = CARGO_DIRT
                     self.state = STATE_HAULING_DIRT
                     world.nav_dirty = True
-            else:
-                # Bedrock hit
-                self.dig_streak = 0
-                self.cargo = CARGO_DIRT
-                self.state = STATE_HAULING_DIRT
-                world.nav_dirty = True
             return
 
-        # 3. Heading to dig site
+        # 3. Heading to dig site using flow field
         self.state = STATE_GOING_TO_DIG
+        surf_y = world.get_surface_y(self.x)
+        if self.y <= surf_y + 4:
+            # On surface: head to entrance crater
+            entrance_x = world.width // 2
+            dx = entrance_x - self.x
+            if abs(dx) > 10:
+                self.target_angle = 0.0 if dx > 0 else math.pi
+            else:
+                self.target_angle = math.pi / 2
+            return
+
         tx, ty = self.dig_target
         dist_to_target = math.hypot(tx - self.x, ty - self.y)
 
-        # Check if right in front of solid diggable dirt
+        # Check if within 14px of dig target or front is solid diggable dirt
         front_x = self.x + math.cos(self.angle) * 8.0
         front_y = self.y + math.sin(self.angle) * 8.0
-        if world.get_cell(front_x, front_y) not in (0, 5) and (dist_to_target < 35 or self.y > 200):
-            # Start dig streak!
-            self.dig_streak = random.randint(8, 14)
-            self.dig_angle = math.atan2(ty - self.y, tx - self.x) if dist_to_target > 6 else self.angle
+        if dist_to_target < 14.0 or (world.get_cell(front_x, front_y) not in (0, 5) and self.y > 200):
             self.state = STATE_DIGGING
+            self.dig_bites_remaining = 10
+            self.dig_bite_timer = 0.0
             return
 
-        # Follow navigation field toward the chamber nearest to the dig site
-        target_field = "royal" if ty > 380 else "pantry" if tx < (world.width // 2) else "nursery"
-        vx, vy, _ = world.get_flow_direction(self.x, self.y, target_field)
+        # Follow "dig" flow field
+        vx, vy, _ = world.get_flow_direction(self.x, self.y, "dig")
         self.target_angle = math.atan2(vy, vx)
 
     def _update_nurse(self, dt, world, pheromones, colony):
@@ -482,10 +488,9 @@ class Ant:
         if self.cargo == CARGO_EGG:
             self.state = STATE_RELOCATING_EGG
             vx, vy, dist = world.get_flow_direction(self.x, self.y, "nursery")
-            if dist < 16:
-                # Place egg in nursery cluster
+            if dist < 14:
                 if self.carried_egg:
-                    self.carried_egg.x = self.x + random.uniform(-5, 5)
+                    self.carried_egg.x = self.x + random.uniform(-4, 4)
                     self.carried_egg.y = self.y + random.uniform(-3, 3)
                     self.carried_egg.carried = False
                     self.carried_egg = None
@@ -500,7 +505,6 @@ class Ant:
         if self.state == STATE_FEEDING_LARVA:
             dist_nursery = math.hypot(nx - self.x, ny - self.y)
             if dist_nursery < 25:
-                # Feed larva
                 for b in colony.brood:
                     if b.stage == Brood.STAGE_LARVA and b.fed_count < 3 and colony.food_stockpile > 0:
                         b.fed_count += 1
@@ -523,86 +527,70 @@ class Ant:
                     self.state = STATE_RELOCATING_EGG
                     return
 
-        # Check hungry larva
         for b in colony.brood:
             if b.stage == Brood.STAGE_LARVA and b.fed_count < 3 and colony.food_stockpile > 0:
                 self.state = STATE_FEEDING_LARVA
                 return
 
-        # Gentle pacing between nursery and royal chamber
-        target_chamber = "nursery" if random.random() < 0.6 else "royal"
-        vx, vy, _ = world.get_flow_direction(self.x, self.y, target_chamber)
+        # Pacing near nursery
+        vx, vy, _ = world.get_flow_direction(self.x, self.y, "nursery")
         self.target_angle = math.atan2(vy, vx)
 
     def _step_movement(self, dt, world):
-        """Wall collision avoidance, surface ground contour snapping, and smooth stepping."""
-        # Smooth turning toward target_angle
+        """Clean single-authority movement with wall sliding and surface contour ground-hugging."""
+        if self.state == STATE_DIGGING:
+            return # Stay in place while actively carving
+
+        # 1. Smooth turn interpolation (0.25 rad per unit dt)
         diff = (self.target_angle - self.angle + math.pi) % (2 * math.pi) - math.pi
-        self.angle += diff * min(1.0, 5.0 * dt)
+        self.angle += diff * min(1.0, 0.25 * dt)
 
-        is_actively_digging = (self.caste == CASTE_WORKER and self.subrole == SUBROLE_EXCAVATOR and self.dig_streak > 0)
-
-        if not is_actively_digging:
-            # Three feelers ahead to avoid walls
-            feeler_dist = 6.0
-            cx = self.x + math.cos(self.angle) * feeler_dist
-            cy = self.y + math.sin(self.angle) * feeler_dist
-            lx = self.x + math.cos(self.angle + 0.55) * feeler_dist
-            ly = self.y + math.sin(self.angle + 0.55) * feeler_dist
-            rx = self.x + math.cos(self.angle - 0.55) * feeler_dist
-            ry = self.y + math.sin(self.angle - 0.55) * feeler_dist
-
-            c_solid = world.is_solid(cx, cy)
-            l_solid = world.is_solid(lx, ly)
-            r_solid = world.is_solid(rx, ry)
-
-            if c_solid:
-                if not l_solid:
-                    self.target_angle += 1.2
-                elif not r_solid:
-                    self.target_angle -= 1.2
-                else:
-                    self.target_angle += math.pi + random.uniform(-0.3, 0.3)
-            else:
-                if l_solid and not r_solid:
-                    self.target_angle -= 0.12
-                elif r_solid and not l_solid:
-                    self.target_angle += 0.12
-
-        # Step forward
+        # 2. Calculate intended next position
         move_speed = self.speed * (0.85 if self.cargo != CARGO_NONE else 1.0)
-        nx = self.x + math.cos(self.angle) * move_speed * dt
-        ny = self.y + math.sin(self.angle) * move_speed * dt
+        step_dist = move_speed * dt
+        nx = self.x + math.cos(self.angle) * step_dist
+        ny = self.y + math.sin(self.angle) * step_dist
 
-        # Boundary clamping
+        # Clamp inside world boundaries
         nx = max(8, min(world.width - 8, nx))
         ny = max(8, min(world.height - 8, ny))
 
-        # --- Surface Ground-Hugging (Zero Sky Flying) ---
+        # 3. Surface ground-hugging: strictly snap y to terrain line
         surf_y = world.get_surface_y(nx)
-        is_at_or_above_surface = (ny <= surf_y + 4)
-        is_over_entrance = not world.is_solid(nx, SURFACE_Y + 8)
+        is_at_or_above_surface = (ny <= surf_y + 3)
+        entrance_x = world.width // 2
+        is_near_entrance = (abs(nx - entrance_x) <= 12)
 
-        # Allow downward descent if over entrance crater
         wants_to_descend = (
-            self.state in (STATE_RETURNING_FOOD, STATE_GOING_TO_DIG, STATE_HAULING_DIRT)
-            and math.sin(self.angle) > 0.05
+            self.state in (STATE_RETURNING_FOOD, STATE_GOING_TO_DIG)
+            and is_near_entrance
         )
 
         if is_at_or_above_surface:
-            if not is_over_entrance or not wants_to_descend:
-                # Snap strictly to ground contour!
+            if not wants_to_descend:
+                # Snap strictly to ground contour - never float in sky!
                 ny = surf_y - 2
                 slope = (world.get_surface_y(nx + 4) - world.get_surface_y(nx - 4)) / 8.0
                 base_angle = 0.0 if math.cos(self.angle) >= 0 else math.pi
                 self.target_angle = base_angle + math.atan(slope) * (1.0 if math.cos(self.angle) >= 0 else -1.0)
 
-        # Commit position
-        if not world.is_solid(nx, ny) or is_actively_digging:
+        # 4. Collision check and parallel sliding (never bounce 180 deg)
+        if not world.is_solid(nx, ny):
+            self.distance_traveled += math.hypot(nx - self.x, ny - self.y)
             self.x = nx
             self.y = ny
         else:
-            self.target_angle += math.pi * 0.75
+            # Try sliding along x-axis only
+            if not world.is_solid(nx, self.y):
+                self.distance_traveled += abs(nx - self.x)
+                self.x = nx
+            # Or try sliding along y-axis only
+            elif not world.is_solid(self.x, ny):
+                self.distance_traveled += abs(ny - self.y)
+                self.y = ny
+            else:
+                # Small gentle adjustment without 180 bounce
+                self.target_angle += random.choice([-0.3, 0.3])
 
 
 class AntColony:
@@ -621,6 +609,9 @@ class AntColony:
         self.max_ants = 320
         self.tick_counter = 0
 
+        # Track total stats for verification
+        self.total_food_delivered = 0
+
         # Spawn Queen in Royal Chamber
         qx, qy = world.royal_chamber_pos
         self.queen = Ant(qx, qy, caste=CASTE_QUEEN, colony=self)
@@ -629,12 +620,22 @@ class AntColony:
         # Spawn starter Workers with balanced subroles (45% Forager, 35% Excavator, 20% Nurse)
         spawned_workers = 0
         attempts = 0
-        while spawned_workers < 28 and attempts < 120:
+        while spawned_workers < 28 and attempts < 150:
             attempts += 1
-            ax = qx + random.uniform(-30, 30)
-            ay = qy + random.uniform(-16, 16)
-            if not world.is_solid(ax, ay):
-                subrole = SUBROLE_FORAGER if spawned_workers % 10 < 5 else SUBROLE_EXCAVATOR if spawned_workers % 10 < 8 else SUBROLE_NURSE
+            subrole = SUBROLE_FORAGER if spawned_workers % 10 < 5 else SUBROLE_EXCAVATOR if spawned_workers % 10 < 8 else SUBROLE_NURSE
+            if subrole == SUBROLE_FORAGER and spawned_workers < 5:
+                # Early foragers patrolling surface grass / entrance mound
+                ax = 640 + random.uniform(-40, 40)
+                ay = world.get_surface_y(ax) - 2
+            elif subrole == SUBROLE_FORAGER and spawned_workers < 8:
+                # Early foragers in upper entrance shaft
+                ax = 640 + random.uniform(-8, 8)
+                ay = random.uniform(160, 220)
+            else:
+                ax = qx + random.uniform(-30, 30)
+                ay = qy + random.uniform(-16, 16)
+
+            if not world.is_solid(ax, ay) or ay <= world.get_surface_y(ax):
                 self.ants.append(Ant(ax, ay, caste=CASTE_WORKER, subrole=subrole, colony=self))
                 spawned_workers += 1
 
@@ -704,10 +705,10 @@ class AntColony:
                     for n in neighbors:
                         if (n is not ant and n.caste == CASTE_WORKER and n.cargo == CARGO_NONE 
                                 and n.greeting_cooldown <= 0 and n.greeting_timer <= 0):
-                            ant.greeting_timer = 0.25
-                            n.greeting_timer = 0.25
-                            ant.greeting_cooldown = 12.0
-                            n.greeting_cooldown = 12.0
+                            ant.greeting_timer = 8.0 # 8 ticks greeting
+                            n.greeting_timer = 8.0
+                            ant.greeting_cooldown = 300.0 # 10s cooldown
+                            n.greeting_cooldown = 300.0
                             break
 
         # 3. Update Ants

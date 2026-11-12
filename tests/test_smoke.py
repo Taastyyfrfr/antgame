@@ -137,18 +137,15 @@ class TestAntColonySimulator(unittest.TestCase):
         rx, ry = self.world.royal_chamber_pos
         excavator = Ant(x=rx, y=ry, caste=CASTE_WORKER, colony=self.colony)
         excavator.subrole = "Excavator"
-        excavator.dig_streak = 5
-        excavator.dig_angle = 0.0 # Dig rightward
+        excavator.state = "Digging"
+        excavator.dig_bites_remaining = 5
+        excavator.dig_bite_timer = 2.9
         
-        # Count solid cells to the right before digging
-        test_x = int(rx + 25)
-        test_y = int(ry)
-        
-        for _ in range(6):
+        for _ in range(16):
             excavator.update(1.0, self.world, self.pheromones, self.colony.spatial_hash, self.colony)
             
         # The excavator should have completed its streak and picked up dirt
-        self.assertEqual(excavator.dig_streak, 0)
+        self.assertEqual(excavator.dig_bites_remaining, 0)
         self.assertEqual(excavator.cargo, 2) # CARGO_DIRT
 
     def test_natural_surface_food_spawning(self):
