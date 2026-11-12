@@ -40,9 +40,9 @@ def main():
     renderer = Renderer(width=WIDTH, height=HEIGHT)
     ui = UI(width=WIDTH, height=HEIGHT)
 
-    # State & FPS throttle
-    target_fps = 30
-    user_target_fps = 30 # Can be toggled between 30 and 60
+    # State & FPS throttle (Smooth 60 FPS Focused / 15 FPS Unfocused)
+    target_fps = 60
+    user_target_fps = 60 # Default 60 FPS (toggle with F to 30)
     eco_mode = False
     show_pheromones = False
     fullscreen = False

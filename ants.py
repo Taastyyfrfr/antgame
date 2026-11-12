@@ -349,11 +349,12 @@ class Ant:
                 # Inside tunnels: follow flow field to pantry
                 vx, vy, dist = world.get_flow_direction(self.x, self.y, "pantry")
                 px, py = world.food_storage_pos
-                if dist < 24 or math.hypot(px - self.x, py - self.y) < 28:
+                if dist < 6 or math.hypot(px - self.x, py - self.y) < 28:
                     # Reached pantry! Store food
                     self.cargo = CARGO_NONE
                     colony.food_stockpile += 1
                     colony.total_food_delivered += 1
+                    world.add_pantry_food(amount=1, food_type=random.choice(["sugar", "seed", "fruit"]))
                     self.energy = 100.0
                     self.state = STATE_EXITING_NEST
                     return
@@ -414,7 +415,7 @@ class Ant:
                     world.fill_pixel(self.x, surf_y, 6) # CELL_MOUND
                     world.fill_pixel(self.x, surf_y - 1, 6) # Mound height
                     self.cargo = CARGO_NONE
-                    self.dig_target = world.get_active_dig_target()
+                    self.dig_target = world.get_active_dig_target(self.id)
                     self.state = STATE_GOING_TO_DIG
                     self.surface_dir = -self.surface_dir
                     return
@@ -423,25 +424,35 @@ class Ant:
                 self.target_angle = math.atan2(vy, vx)
             return
 
-        # 2. Executing an active digging streak (10 bites, 1 bite every 3 ticks)
+        # 2. Executing an active digging streak (8 bites, 1 bite every 3 ticks)
         if self.state == STATE_DIGGING or self.dig_bites_remaining > 0:
             self.state = STATE_DIGGING
             self.dig_bite_timer += dt
 
-            # Stop moving translationally while biting dirt
             tx, ty = self.dig_target
-            self.target_angle = math.atan2(ty - self.y, tx - self.x) if math.hypot(tx - self.x, ty - self.y) > 5 else self.angle
+            angle_to_target = math.atan2(ty - self.y, tx - self.x) if math.hypot(tx - self.x, ty - self.y) > 2 else self.angle
+            self.target_angle = angle_to_target
 
             if self.dig_bite_timer >= 3.0:
                 self.dig_bite_timer = 0.0
-                bite_x = self.x + math.cos(self.target_angle) * 7.0
-                bite_y = self.y + math.sin(self.target_angle) * 7.0
+                bite_x = self.x + math.cos(angle_to_target) * 6.0
+                bite_y = self.y + math.sin(angle_to_target) * 6.0
 
                 if world.get_cell(bite_x, bite_y) != 5: # Not bedrock
-                    world.carve_circle(bite_x, bite_y, radius=7, play_effects=True)
+                    world.carve_circle(bite_x, bite_y, radius=6, play_effects=True)
                     self.dig_bites_remaining -= 1
-                    # Spawn dirt particles
-                    world.add_falling_dirt(bite_x, bite_y)
+                    world.add_dust(bite_x, bite_y) # Visual dust only (never settles!)
+
+                    # Step forward 3.5px into newly carved space
+                    step_x = math.cos(angle_to_target) * 3.5
+                    step_y = math.sin(angle_to_target) * 3.5
+                    if not world.is_solid(self.x + step_x, self.y + step_y):
+                        self.x += step_x
+                        self.y += step_y
+                        self.distance_traveled += 3.5
+
+                    # Advance dig target along blueprint
+                    self.dig_target = world.get_active_dig_target(self.id)
                 else:
                     self.dig_bites_remaining = 0
 
@@ -467,12 +478,10 @@ class Ant:
         tx, ty = self.dig_target
         dist_to_target = math.hypot(tx - self.x, ty - self.y)
 
-        # Check if within 14px of dig target or front is solid diggable dirt
-        front_x = self.x + math.cos(self.angle) * 8.0
-        front_y = self.y + math.sin(self.angle) * 8.0
-        if dist_to_target < 14.0 or (world.get_cell(front_x, front_y) not in (0, 5) and self.y > 200):
+        # Check if reached assigned dig target (no premature wall digging)
+        if dist_to_target < 16.0:
             self.state = STATE_DIGGING
-            self.dig_bites_remaining = 10
+            self.dig_bites_remaining = 8
             self.dig_bite_timer = 0.0
             return
 
@@ -484,24 +493,27 @@ class Ant:
         """Nurse: Uses flow fields to care for brood, group eggs in nursery, and feed hungry larvae."""
         nx, ny = world.nursery_chamber_pos
 
-        # 1. Relocating egg to nursery
+        # 1. Relocating egg to egg zone on nursery floor
         if self.cargo == CARGO_EGG:
             self.state = STATE_RELOCATING_EGG
-            vx, vy, dist = world.get_flow_direction(self.x, self.y, "nursery")
-            if dist < 14:
+            egg_zone_x = nx - 16
+            egg_zone_y = ny + 4
+            dist_to_zone = math.hypot(egg_zone_x - self.x, egg_zone_y - self.y)
+            if dist_to_zone < 16:
                 if self.carried_egg:
-                    self.carried_egg.x = self.x + random.uniform(-4, 4)
-                    self.carried_egg.y = self.y + random.uniform(-3, 3)
+                    self.carried_egg.x = egg_zone_x + random.uniform(-6, 6)
+                    self.carried_egg.y = egg_zone_y + random.uniform(-3, 3)
                     self.carried_egg.carried = False
                     self.carried_egg = None
                 self.cargo = CARGO_NONE
                 self.state = STATE_NURSING
                 return
             else:
+                vx, vy, _ = world.get_flow_direction(self.x, self.y, "nursery")
                 self.target_angle = math.atan2(vy, vx)
             return
 
-        # 2. Feeding hungry larvae
+        # 2. Feeding hungry larvae (in center of nursery floor)
         if self.state == STATE_FEEDING_LARVA:
             dist_nursery = math.hypot(nx - self.x, ny - self.y)
             if dist_nursery < 25:
@@ -509,6 +521,11 @@ class Ant:
                     if b.stage == Brood.STAGE_LARVA and b.fed_count < 3 and colony.food_stockpile > 0:
                         b.fed_count += 1
                         colony.food_stockpile = max(0, colony.food_stockpile - 1)
+                        # Also consume from pantry food drops if present
+                        for f in world.food_items:
+                            if f.amount > 0 and math.hypot(world.food_storage_pos[0] - f.x, world.food_storage_pos[1] - f.y) < 40:
+                                f.amount -= 1
+                                break
                         break
                 self.state = STATE_NURSING
             else:
@@ -650,14 +667,14 @@ class AntColony:
                 self.ants.append(Ant(sx, sy, caste=CASTE_SOLDIER, colony=self))
                 spawned_soldiers += 1
 
-        # Spawn initial brood in nursery
+        # Spawn initial brood in nursery spread across flat floor
         nx, ny = world.nursery_chamber_pos
         for _ in range(8):
-            self.brood.append(Brood(nx + random.uniform(-15, 15), ny + random.uniform(-8, 8), Brood.STAGE_EGG))
+            self.brood.append(Brood(nx - 16 + random.uniform(-8, 6), ny + 4 + random.uniform(-3, 3), Brood.STAGE_EGG))
         for _ in range(5):
-            self.brood.append(Brood(nx + random.uniform(-15, 15), ny + random.uniform(-8, 8), Brood.STAGE_LARVA))
+            self.brood.append(Brood(nx + random.uniform(-8, 8), ny + 5 + random.uniform(-3, 3), Brood.STAGE_LARVA))
         for _ in range(4):
-            self.brood.append(Brood(nx + random.uniform(-15, 15), ny + random.uniform(-8, 8), Brood.STAGE_PUPA))
+            self.brood.append(Brood(nx + 16 + random.uniform(-6, 8), ny + 4 + random.uniform(-3, 3), Brood.STAGE_PUPA))
 
     def spawn_brood(self, x, y, stage=Brood.STAGE_EGG):
         if len(self.brood) < 120:

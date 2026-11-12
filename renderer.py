@@ -286,8 +286,16 @@ class Renderer:
             pygame.draw.circle(surface, (255, 220, 80), (int(ix), int(iy)), int(ant.length + 6), 1)
 
     def draw_particles(self, surface, world):
-        """Draws falling loose dirt grains and water droplets."""
-        # Dirt grains
+        """Draws falling loose dirt grains, visual dust specks, and water droplets."""
+        # Visual dust specks from ant digging (fade out with remaining life)
+        for d in world.dust_particles:
+            ratio = max(0.2, min(1.0, d[4] / 20.0))
+            col = (int(85 * ratio + 30), int(55 * ratio + 20), int(35 * ratio + 15))
+            ix, iy = int(d[0]), int(d[1])
+            if 0 <= ix < self.width and 0 <= iy < self.height:
+                surface.set_at((ix, iy), col)
+
+        # Falling heavy sand grains (God power TOOL_DIRT only)
         for p in world.falling_dirt:
             pygame.draw.rect(surface, (120, 82, 52), (int(p[0]), int(p[1]), 2, 2))
 

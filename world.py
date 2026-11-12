@@ -30,7 +30,57 @@ PALETTE = {
     CELL_MOUND: (115, 78, 50),     # Excavated loose mound dirt
 }
 
+PALETTE_RGB = np.array([
+    [38, 28, 22],   # CELL_AIR: Dark excavated background tunnel
+    [102, 68, 45],  # CELL_TOPSOIL: Rich organic dark brown
+    [128, 85, 54],  # CELL_LOAM: Warm earthy brown
+    [148, 86, 48],  # CELL_CLAY: Terracotta / reddish clay
+    [90, 85, 80],   # CELL_STONE: Dense grey mineral stone
+    [50, 48, 52],   # CELL_BEDROCK: Deep impenetrable dark bedrock
+    [115, 78, 50],  # CELL_MOUND: Excavated loose mound dirt
+], dtype=np.float32)
+
 SURFACE_Y = 130  # Top 18% of 720 is surface air (0 to 130)
+
+
+class ExcavationBlueprint:
+    """Manages an autonomous multi-step excavation project (shaft extension, side branch, chamber)."""
+    def __init__(self, name, waypoints, chamber_radius=0):
+        self.name = name
+        self.waypoints = list(waypoints)
+        self.chamber_radius = chamber_radius
+        self.current_idx = 0
+        self.completed = False
+
+    def get_current_target(self, world):
+        """Returns the active (x, y) target where solid dirt needs to be carved."""
+        while self.current_idx < len(self.waypoints):
+            tx, ty = self.waypoints[self.current_idx]
+            if world.is_solid(tx, ty) and world.get_cell(tx, ty) != CELL_BEDROCK:
+                return tx, ty
+            has_solid = False
+            for dx, dy in ((0, 6), (0, -6), (6, 0), (-6, 0)):
+                if world.is_solid(tx + dx, ty + dy) and world.get_cell(tx + dx, ty + dy) != CELL_BEDROCK:
+                    has_solid = True
+                    return tx + dx, ty + dy
+            if not has_solid:
+                self.current_idx += 1
+            else:
+                return tx, ty
+
+        # If waypoints carved, carve domed chamber at terminal point
+        if self.chamber_radius > 0 and len(self.waypoints) > 0:
+            cx, cy = self.waypoints[-1]
+            for r in range(8, self.chamber_radius, 4):
+                for ang in (0, 0.785, 1.57, 2.356, 3.141, 3.927, 4.712, 5.497):
+                    tx = cx + math.cos(ang) * r
+                    ty = cy + math.sin(ang) * (r * 0.6)
+                    if world.is_solid(tx, ty) and world.get_cell(tx, ty) != CELL_BEDROCK:
+                        return tx, ty
+
+        self.completed = True
+        return None
+
 
 class World:
     def __init__(self, width=1280, height=720, cell_size=2, chunk_size_px=64):
@@ -50,7 +100,7 @@ class World:
         self.grid = np.zeros((self.cols, self.rows), dtype=np.uint8)
         self.moisture = np.zeros((self.cols, self.rows), dtype=np.float32)
 
-        # Chunk management
+        # Chunk management with SRCALPHA
         self.chunk_surfaces = []
         self.chunk_dirty = np.ones((self.chunks_x, self.chunks_y), dtype=bool)
 
@@ -59,44 +109,58 @@ class World:
             for cy in range(self.chunks_y):
                 w = min(chunk_size_px, self.width - cx * chunk_size_px)
                 h = min(chunk_size_px, self.height - cy * chunk_size_px)
-                row_surfs.append(pygame.Surface((w, h)))
+                row_surfs.append(pygame.Surface((w, h), pygame.SRCALPHA))
             self.chunk_surfaces.append(row_surfs)
 
-        # Falling particles: dirt grains and water drops
-        self.falling_dirt = []  # list of [x, y, vx, vy]
-        self.water_droplets = [] # list of [x, y, vx, vy]
-        self.food_items = []    # list of FoodItem objects
+        # Particles: harmless visual dust from digging, falling sand from God power, and water
+        self.dust_particles = []  # list of [x, y, vx, vy, life] - visual only, never settles!
+        self.falling_dirt = []    # list of [x, y, vx, vy] - heavy sand from God power TOOL_DIRT only
+        self.water_droplets = []  # list of [x, y, vx, vy]
+        self.food_items = []      # list of FoodItem objects
         self.surface_food_timer = 0.0
         self.total_carved_cells = 0
 
-        # Navigation Flow Fields on the exact 2x2 World Grid (640 x 360)
-        self.dist_to_surface = np.full((self.cols, self.rows), 99999, dtype=np.int32)
-        self.dist_to_pantry = np.full((self.cols, self.rows), 99999, dtype=np.int32)
-        self.dist_to_nursery = np.full((self.cols, self.rows), 99999, dtype=np.int32)
-        self.dist_to_royal = np.full((self.cols, self.rows), 99999, dtype=np.int32)
-        self.dist_to_dig = np.full((self.cols, self.rows), 99999, dtype=np.int32)
+        # Navigation Flow Fields on the 4x4 Grid (320 x 180, 4x fewer cells than 640x360)
+        self.nav_scale = 4
+        self.nav_cols = width // self.nav_scale      # 320
+        self.nav_rows = height // self.nav_scale     # 180
+        self.nav_surface_row = SURFACE_Y // self.nav_scale # 32
+
+        self.dist_to_surface = np.full((self.nav_cols, self.nav_rows), 99999, dtype=np.int32)
+        self.dist_to_pantry = np.full((self.nav_cols, self.nav_rows), 99999, dtype=np.int32)
+        self.dist_to_nursery = np.full((self.nav_cols, self.nav_rows), 99999, dtype=np.int32)
+        self.dist_to_royal = np.full((self.nav_cols, self.nav_rows), 99999, dtype=np.int32)
+        self.dist_to_dig = np.full((self.nav_cols, self.nav_rows), 99999, dtype=np.int32)
+
         self.nav_dirty = True
-        self.nav_timer = 0
+        self.nav_step_idx = 0
         self._dial_buckets = [deque() for _ in range(4)]
 
-        # Planned colony excavation targets (deepening shaft, chambers, side pockets)
-        self.dig_targets = [
-            (640, 465),
-            (640, 505),
-            (640, 545),
-            (600, 440),
-            (680, 440),
-            (480, 380),
-            (800, 380),
-            (810, 330),
-            (470, 310)
+        # Autonomous excavation blueprints (deepening main shaft, branching tunnels, chambers)
+        self.blueprints = [
+            ExcavationBlueprint("Deep Shaft Extension", [
+                (640, 465), (640, 490), (640, 515), (640, 545), (640, 575), (640, 605)
+            ]),
+            ExcavationBlueprint("Lower Nursery Branch (Right)", [
+                (640, 475), (670, 495), (700, 515), (735, 530), (770, 540)
+            ], chamber_radius=28),
+            ExcavationBlueprint("Deep Granary Branch (Left)", [
+                (640, 485), (610, 505), (580, 525), (545, 540), (510, 550)
+            ], chamber_radius=26),
+            ExcavationBlueprint("Mid-Level Gallery (Left)", [
+                (640, 240), (600, 235), (560, 230), (520, 225), (480, 220)
+            ], chamber_radius=22),
+            ExcavationBlueprint("Mid-Level Gallery (Right)", [
+                (640, 240), (680, 235), (720, 230), (760, 225), (800, 220)
+            ], chamber_radius=22),
         ]
+        self.dig_targets = [(640, 465)] # Fallback target
 
         # Generate world layers and starter colony
         self._generate_terrain()
         self._carve_starter_colony()
         self.mark_all_chunks_dirty()
-        self.update_flow_fields(force=True)
+        self.update_all_flow_fields()
 
     def _generate_terrain(self):
         """Generates cross-section subterranean layers with natural noise."""
@@ -283,66 +347,89 @@ class World:
                 return r * self.cell_size
         return SURFACE_Y
 
-    def update_flow_fields(self, force=False):
-        """
-        Recomputes centerline-weighted subterranean flow fields directly on the 2x2 world grid (640x360).
-        Open cells adjacent to solid dirt receive a higher cost (+3) than centerline cells (+1),
-        naturally routing ants down the exact middle of narrow tunnels without wall scraping.
-        Runs only when terrain is modified (dirty) or forced.
-        """
-        if not self.nav_dirty and not force:
-            return
-        self.nav_dirty = False
+    def _get_nav_masks(self):
+        """Builds open air mask and boundary border mask on the 4x4 nav grid (320x180)."""
+        sub = (self.grid == CELL_AIR)
+        open_mask = sub[0::2, 0::2] | sub[1::2, 0::2] | sub[0::2, 1::2] | sub[1::2, 1::2]
+        open_mask[:, :self.nav_surface_row] = False
 
-        surf_r = self.surface_row
-
-        # 1. Open mask of subterranean air cells
-        open_mask = (self.grid == CELL_AIR)
-        open_mask[:, :surf_r] = False
-
-        # 2. Vectorized boundary detection: open air cells adjacent to solid earth
-        solid = (self.grid != CELL_AIR)
-        is_border = np.zeros((self.cols, self.rows), dtype=bool)
+        solid = ~open_mask
+        is_border = np.zeros((self.nav_cols, self.nav_rows), dtype=bool)
         border = open_mask[1:-1, 1:-1] & (
             solid[:-2, 1:-1] | solid[2:, 1:-1] | solid[1:-1, :-2] | solid[1:-1, 2:]
         )
         is_border[1:-1, 1:-1] = border
+        return open_mask, is_border
 
-        # 3. Surface entrance flow field (target at crater entrance: col=320, row=surf_r)
-        self._fill_dials(self.dist_to_surface, 320, surf_r, open_mask, is_border)
+    def update_all_flow_fields(self):
+        """Recomputes all 5 flow fields synchronously on 4x4 grid (used at startup / forced)."""
+        open_mask, is_border = self._get_nav_masks()
+        self._fill_dials(self.dist_to_surface, self.nav_cols // 2, self.nav_surface_row, open_mask, is_border)
 
-        # 4. Food pantry flow field
         px, py = self.food_storage_pos
-        self._fill_dials(self.dist_to_pantry, int(px // self.cell_size), int(py // self.cell_size), open_mask, is_border)
+        self._fill_dials(self.dist_to_pantry, int(px // self.nav_scale), int(py // self.nav_scale), open_mask, is_border)
 
-        # 5. Nursery flow field
         nx, ny = self.nursery_chamber_pos
-        self._fill_dials(self.dist_to_nursery, int(nx // self.cell_size), int(ny // self.cell_size), open_mask, is_border)
+        self._fill_dials(self.dist_to_nursery, int(nx // self.nav_scale), int(ny // self.nav_scale), open_mask, is_border)
 
-        # 6. Royal chamber flow field
         rx, ry = self.royal_chamber_pos
-        self._fill_dials(self.dist_to_royal, int(rx // self.cell_size), int(ry // self.cell_size), open_mask, is_border)
+        self._fill_dials(self.dist_to_royal, int(rx // self.nav_scale), int(ry // self.nav_scale), open_mask, is_border)
 
-        # 7. Excavation dig target flow field
-        dtx, dty = self.get_active_dig_target()
-        self._fill_dials(self.dist_to_dig, int(dtx // self.cell_size), int(dty // self.cell_size), open_mask, is_border)
+        targets = self.get_active_dig_targets()
+        self._fill_dials_multi(self.dist_to_dig, targets, open_mask, is_border)
+
+        self.nav_dirty = False
+        self.nav_step_idx = 0
+
+    def update_flow_fields(self, force=False):
+        """Called externally; if force is True, updates all immediately."""
+        if force:
+            self.update_all_flow_fields()
+        else:
+            self.step_flow_fields()
+
+    def step_flow_fields(self):
+        """Staggers updates across frames: updates at most ONE flow field per frame when nav_dirty is True."""
+        if not self.nav_dirty:
+            return
+
+        open_mask, is_border = self._get_nav_masks()
+
+        if self.nav_step_idx == 0:
+            self._fill_dials(self.dist_to_surface, self.nav_cols // 2, self.nav_surface_row, open_mask, is_border)
+        elif self.nav_step_idx == 1:
+            px, py = self.food_storage_pos
+            self._fill_dials(self.dist_to_pantry, int(px // self.nav_scale), int(py // self.nav_scale), open_mask, is_border)
+        elif self.nav_step_idx == 2:
+            nx, ny = self.nursery_chamber_pos
+            self._fill_dials(self.dist_to_nursery, int(nx // self.nav_scale), int(ny // self.nav_scale), open_mask, is_border)
+        elif self.nav_step_idx == 3:
+            rx, ry = self.royal_chamber_pos
+            self._fill_dials(self.dist_to_royal, int(rx // self.nav_scale), int(ry // self.nav_scale), open_mask, is_border)
+        elif self.nav_step_idx == 4:
+            targets = self.get_active_dig_targets()
+            self._fill_dials_multi(self.dist_to_dig, targets, open_mask, is_border)
+
+        self.nav_step_idx += 1
+        if self.nav_step_idx >= 5:
+            self.nav_step_idx = 0
+            self.nav_dirty = False
 
     def _fill_dials(self, dist_arr, target_c, target_r, open_mask, is_border):
-        """Dial's algorithm for centerline-weighted integer-distance BFS on the 2x2 grid."""
+        """Dial's algorithm on the 4x4 nav grid (320x180)."""
         dist_arr.fill(99999)
-        surf_r = self.surface_row
+        surf_r = self.nav_surface_row
 
-        target_c = max(1, min(self.cols - 2, target_c))
-        target_r = max(surf_r, min(self.rows - 2, target_r))
+        target_c = max(1, min(self.nav_cols - 2, target_c))
+        target_r = max(surf_r, min(self.nav_rows - 2, target_r))
 
-        # If designated target cell is solid dirt, find nearest open air cell
         if not open_mask[target_c, target_r]:
             found = False
-            for r_dist in range(1, 15):
+            for r_dist in range(1, 10):
                 for dc in range(-r_dist, r_dist + 1):
                     for dr in range(-r_dist, r_dist + 1):
                         nc, nr = target_c + dc, target_r + dr
-                        if 1 <= nc < self.cols - 1 and surf_r <= nr < self.rows - 1:
+                        if 1 <= nc < self.nav_cols - 1 and surf_r <= nr < self.nav_rows - 1:
                             if open_mask[nc, nr]:
                                 target_c, target_r = nc, nr
                                 found = True
@@ -377,8 +464,69 @@ class World:
 
             for dc, dr in dirs:
                 nc, nr = c + dc, r + dr
-                if 0 <= nc < self.cols and surf_r <= nr < self.rows and open_mask[nc, nr]:
-                    # Centerline weight: 3 if next to wall, 1 if open center
+                if 0 <= nc < self.nav_cols and surf_r <= nr < self.nav_rows and open_mask[nc, nr]:
+                    step_cost = 3 if is_border[nc, nr] else 1
+                    nd = d + step_cost
+                    if nd < dist_arr[nc, nr]:
+                        dist_arr[nc, nr] = nd
+                        self._dial_buckets[nd % 4].append((nc, nr))
+                        active += 1
+
+    def _fill_dials_multi(self, dist_arr, targets, open_mask, is_border):
+        """Multi-source Dial BFS initializing multiple active dig targets at distance 0."""
+        dist_arr.fill(99999)
+        surf_r = self.nav_surface_row
+
+        for b in self._dial_buckets:
+            b.clear()
+
+        active = 0
+        for tx, ty in targets:
+            tc = int(tx // self.nav_scale)
+            tr = int(ty // self.nav_scale)
+            tc = max(1, min(self.nav_cols - 2, tc))
+            tr = max(surf_r, min(self.nav_rows - 2, tr))
+
+            if not open_mask[tc, tr]:
+                for r_dist in range(1, 10):
+                    found = False
+                    for dc in range(-r_dist, r_dist + 1):
+                        for dr in range(-r_dist, r_dist + 1):
+                            nc, nr = tc + dc, tr + dr
+                            if 1 <= nc < self.nav_cols - 1 and surf_r <= nr < self.nav_rows - 1 and open_mask[nc, nr]:
+                                tc, tr = nc, nr
+                                found = True
+                                break
+                        if found:
+                            break
+                    if found:
+                        break
+
+            if open_mask[tc, tr] and dist_arr[tc, tr] > 0:
+                dist_arr[tc, tr] = 0
+                self._dial_buckets[0].append((tc, tr))
+                active += 1
+
+        if active == 0:
+            return
+
+        idx = 0
+        dirs = ((1, 0), (-1, 0), (0, 1), (0, -1))
+        while active > 0:
+            b_idx = idx % 4
+            b = self._dial_buckets[b_idx]
+            if not b:
+                idx += 1
+                continue
+            c, r = b.popleft()
+            active -= 1
+            d = dist_arr[c, r]
+            if d < idx:
+                continue
+
+            for dc, dr in dirs:
+                nc, nr = c + dc, r + dr
+                if 0 <= nc < self.nav_cols and surf_r <= nr < self.nav_rows and open_mask[nc, nr]:
                     step_cost = 3 if is_border[nc, nr] else 1
                     nd = d + step_cost
                     if nd < dist_arr[nc, nr]:
@@ -388,7 +536,7 @@ class World:
 
     def get_flow_direction(self, px, py, target_name="surface"):
         """
-        Samples 8 neighboring cells on the exact 2x2 grid around (px, py).
+        Samples 8 neighboring cells on the 4x4 grid (320x180) around (px, py).
         Returns a smooth unit steering vector (vx, vy, dist) toward the lowest-distance open neighbor.
         """
         if target_name == "surface":
@@ -402,10 +550,10 @@ class World:
         else: # "royal"
             dist_map = self.dist_to_royal
 
-        col = int(px // self.cell_size)
-        row = int(py // self.cell_size)
+        col = int(px // self.nav_scale)
+        row = int(py // self.nav_scale)
 
-        if not (0 <= col < self.cols and 0 <= row < self.rows):
+        if not (0 <= col < self.nav_cols and 0 <= row < self.nav_rows):
             return 0.0, -1.0, 99999
 
         curr_d = dist_map[col, row]
@@ -417,7 +565,7 @@ class World:
         for ndc, ndr in ((1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (-1, -1), (1, -1), (-1, 1)):
             nc = col + ndc
             nr = row + ndr
-            if 0 <= nc < self.cols and 0 <= nr < self.rows:
+            if 0 <= nc < self.nav_cols and 0 <= nr < self.nav_rows:
                 d = dist_map[nc, nr]
                 if d < best_d:
                     best_d = d
@@ -435,27 +583,30 @@ class World:
         angle = math.atan2(vy, vx) + random.uniform(-0.11, 0.11)
         return math.cos(angle), math.sin(angle), best_d
 
-    def get_active_dig_target(self):
-        """Returns the current expansion excavation target (tx, ty) with solid dirt."""
-        for tx, ty in self.dig_targets:
-            # Check if there is still solid diggable dirt around target
-            has_solid = False
-            for r in range(0, 14, 2):
-                if self.is_solid(tx, ty + r) and self.get_cell(tx, ty + r) != 5:
-                    has_solid = True
-                    return tx, ty + r
-                if self.is_solid(tx + r, ty) and self.get_cell(tx + r, ty) != 5:
-                    has_solid = True
-                    return tx + r, ty
+    def get_active_dig_targets(self):
+        """Returns the list of active excavation targets across current blueprints."""
+        targets = []
+        for bp in self.blueprints:
+            if not bp.completed:
+                t = bp.get_current_target(self)
+                if t:
+                    targets.append(t)
 
-        # If all initial targets carved, create deeper shaft target
-        lowest_y = 550
-        for y in range(460, self.height - 30, 8):
-            if not self.is_solid(640, y):
-                lowest_y = max(lowest_y, y)
-        new_target = (640, min(self.height - 30, lowest_y + 14))
-        self.dig_targets.append(new_target)
-        return new_target
+        if not targets:
+            # Fallback: project a new target deeper down
+            lowest_y = 550
+            for y in range(460, self.height - 30, 8):
+                if not self.is_solid(640, y):
+                    lowest_y = max(lowest_y, y)
+            new_target = (640, min(self.height - 30, lowest_y + 14))
+            targets.append(new_target)
+
+        return targets
+
+    def get_active_dig_target(self, ant_id=0):
+        """Returns an assigned excavation target for a specific excavator based on its ID."""
+        targets = self.get_active_dig_targets()
+        return targets[ant_id % len(targets)]
 
     def get_cell(self, px, py):
         col = int(px // self.cell_size)
@@ -483,8 +634,8 @@ class World:
                 self.mark_chunk_dirty_at_pixel(px, py)
                 self.nav_dirty = True
                 self.total_carved_cells += 1
-                if play_effects and random.random() < 0.2:
-                    self.falling_dirt.append([px, py, random.uniform(-0.5, 0.5), random.uniform(0.5, 2.0)])
+                if play_effects and random.random() < 0.25:
+                    self.add_dust(px, py)
                 return True
         return False
 
@@ -535,17 +686,46 @@ class World:
         """Spawns food at pixel position."""
         self.food_items.append(FoodItem(px, py, amount=amount, food_type=food_type))
 
+    def add_pantry_food(self, amount=1, food_type="sugar"):
+        """Adds a food drop neatly spread across the flat floor of the pantry chamber."""
+        px, py = self.food_storage_pos
+        drop_x = px + random.uniform(-26, 26)
+        drop_y = py + 6
+        self.drop_food(drop_x, drop_y, amount=amount, food_type=food_type)
+
     def add_water_drop(self, px, py):
         """Adds a seeping water droplet."""
         self.water_droplets.append([px, py, random.uniform(-0.2, 0.2), random.uniform(1.0, 2.5)])
 
     def add_falling_dirt(self, px, py):
-        """Adds falling loose dirt grain."""
+        """Adds falling loose dirt grain (heavy sand from God power TOOL_DIRT)."""
         self.falling_dirt.append([px, py, random.uniform(-0.3, 0.3), random.uniform(1.2, 3.0)])
+
+    def add_dust(self, px, py):
+        """Adds harmless visual dust particle that fades out over ~20 ticks without settling into solid earth."""
+        self.dust_particles.append([
+            float(px + random.uniform(-2, 2)),
+            float(py + random.uniform(-2, 2)),
+            random.uniform(-0.6, 0.6),
+            random.uniform(0.4, 1.4),
+            20.0
+        ])
 
     def update_physics(self, dt=1.0):
         """Updates falling dirt, settling sand, and water droplet percolation."""
-        # 1. Falling dirt grains
+        # 0. Harmless visual dust particles from ant excavation (never settle into solid dirt)
+        kept_dust = []
+        for d in self.dust_particles:
+            d[0] += d[2]
+            d[1] += d[3]
+            d[3] = min(3.0, d[3] + 0.08) # gentle gravity
+            d[4] -= dt # life countdown
+            if d[4] > 0 and 0 <= int(d[0]) < self.width and 0 <= int(d[1]) < self.height:
+                if not self.is_solid(d[0], d[1]):
+                    kept_dust.append(d)
+        self.dust_particles = kept_dust
+
+        # 1. Falling dirt grains (heavy sand from God power TOOL_DIRT that settles into CELL_MOUND)
         kept_dirt = []
         for p in self.falling_dirt:
             p[0] += p[2]
@@ -627,14 +807,12 @@ class World:
                 food_type = "seed" if random.random() < 0.6 else "fruit"
                 self.drop_food(spawn_x, spawn_y, amount=random.randint(18, 30), food_type=food_type)
 
-        # 6. Periodic Flow Field Updates (if terrain was modified)
-        self.nav_timer += 1
-        if self.nav_dirty and self.nav_timer >= 15:
-            self.update_flow_fields()
-            self.nav_timer = 0
+        # 6. Staggered Flow Field Updates (at most ONE BFS field per frame when dirty)
+        if self.nav_dirty:
+            self.step_flow_fields()
 
     def render_dirty_chunks(self):
-        """Renders only dirty chunks onto their offscreen surfaces."""
+        """Vectorized offscreen chunk rendering with NumPy array operations (no per-cell draw.rect)."""
         c_px = self.chunk_size_px
         cells_per_chunk = c_px // self.cell_size
 
@@ -649,56 +827,69 @@ class World:
                 end_c = min(self.cols, start_c + cells_per_chunk)
                 end_r = min(self.rows, start_r + cells_per_chunk)
 
-                # Clear surface
-                surf.fill((0, 0, 0, 0))
+                cw = end_c - start_c
+                ch = end_r - start_r
 
-                for c in range(start_c, end_c):
-                    rel_x = (c - start_c) * self.cell_size
-                    for r in range(start_r, end_r):
-                        rel_y = (r - start_r) * self.cell_size
-                        cell = self.grid[c, r]
+                if cw <= 0 or ch <= 0:
+                    self.chunk_dirty[cx, cy] = False
+                    continue
 
-                        if cell == CELL_AIR:
-                            if r < self.surface_row:
-                                # Sky air is completely transparent in chunk surface
-                                continue
-                            else:
-                                # Dug subterranean tunnel background with ambient occlusion
-                                # Check proximity to solid walls for rim shadow
-                                has_solid_neighbor = False
-                                for dc, dr in ((-1, 0), (1, 0), (0, -1), (0, 1)):
-                                    nc, nr = c + dc, r + dr
-                                    if 0 <= nc < self.cols and 0 <= nr < self.rows:
-                                        if self.grid[nc, nr] != CELL_AIR:
-                                            has_solid_neighbor = True
-                                            break
+                chunk_grid = self.grid[start_c:end_c, start_r:end_r]
+                chunk_moist = self.moisture[start_c:end_c, start_r:end_r]
 
-                                if has_solid_neighbor:
-                                    # Darker rim shadow along tunnel walls
-                                    color = (25, 18, 14)
-                                else:
-                                    color = PALETTE[CELL_AIR]
+                # 1. Base colors from vectorized LUT
+                colors = PALETTE_RGB[chunk_grid].copy()
 
-                                pygame.draw.rect(surf, color, (rel_x, rel_y, self.cell_size, self.cell_size))
-                        else:
-                            # Solid soil cell
-                            base_color = list(PALETTE[cell])
+                is_solid = (chunk_grid != CELL_AIR)
+                rows_grid = np.arange(start_r, end_r)[None, :]
+                is_sky = (~is_solid) & (rows_grid < self.surface_row)
 
-                            # Moisture darkens the soil
-                            m = self.moisture[c, r]
-                            if m > 0.05:
-                                factor = max(0.55, 1.0 - m * 0.45)
-                                base_color[0] = int(base_color[0] * factor)
-                                base_color[1] = int(base_color[1] * factor)
-                                base_color[2] = int(base_color[2] * factor)
+                # 2. 1-cell rim shadow along subterranean tunnel walls
+                pad_grid = np.zeros((cw + 2, ch + 2), dtype=np.uint8)
+                pad_grid[1:-1, 1:-1] = chunk_grid
+                if start_c > 0:
+                    pad_grid[0, 1:-1] = self.grid[start_c - 1, start_r:end_r]
+                if end_c < self.cols:
+                    pad_grid[-1, 1:-1] = self.grid[end_c, start_r:end_r]
+                if start_r > 0:
+                    pad_grid[1:-1, 0] = self.grid[start_c:end_c, start_r - 1]
+                if end_r < self.rows:
+                    pad_grid[1:-1, -1] = self.grid[start_c:end_c, end_r]
 
-                            # Subtle procedural grain variation
-                            grain = ((c * 37 + r * 19) % 11) - 5
-                            col_r = min(255, max(0, base_color[0] + grain))
-                            col_g = min(255, max(0, base_color[1] + grain))
-                            col_b = min(255, max(0, base_color[2] + grain))
+                solid_neighbors = (
+                    (pad_grid[:-2, 1:-1] != CELL_AIR) |
+                    (pad_grid[2:, 1:-1] != CELL_AIR) |
+                    (pad_grid[1:-1, :-2] != CELL_AIR) |
+                    (pad_grid[1:-1, 2:] != CELL_AIR)
+                )
+                rim_mask = (~is_solid) & (~is_sky) & solid_neighbors
+                colors[rim_mask] = [25, 18, 14]
 
-                            pygame.draw.rect(surf, (col_r, col_g, col_b), (rel_x, rel_y, self.cell_size, self.cell_size))
+                # 3. Moisture darkening for solid earth
+                has_moisture = is_solid & (chunk_moist > 0.05)
+                factor = np.maximum(0.55, 1.0 - chunk_moist * 0.45)
+                colors[has_moisture] *= factor[has_moisture, None]
+
+                # 4. Procedural grain variation
+                c_indices = np.arange(start_c, end_c)[:, None]
+                grain = (((c_indices * 37 + rows_grid * 19) % 11) - 5).astype(np.float32)
+                colors[is_solid] += grain[is_solid, None]
+
+                # 5. Output arrays
+                final_rgb = np.clip(colors, 0, 255).astype(np.uint8)
+                alpha = np.full((cw, ch), 255, dtype=np.uint8)
+                alpha[is_sky] = 0
+
+                # 6. Blit & scale to chunk surface
+                temp_surf = pygame.Surface((cw, ch), pygame.SRCALPHA)
+                pygame.surfarray.blit_array(temp_surf, final_rgb)
+                alpha_view = pygame.surfarray.pixels_alpha(temp_surf)
+                alpha_view[:, :] = alpha
+                del alpha_view
+
+                dest_w = cw * self.cell_size
+                dest_h = ch * self.cell_size
+                pygame.transform.scale(temp_surf, (dest_w, dest_h), surf)
 
                 self.chunk_dirty[cx, cy] = False
 
