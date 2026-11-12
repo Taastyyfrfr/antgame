@@ -4,6 +4,7 @@ Maintains HOME, FOOD, and DANGER pheromone layers using NumPy.
 Uses non-wrapping slice indexing for diffusion to avoid boundary wrap-around.
 """
 
+import math
 import numpy as np
 import pygame
 
@@ -55,6 +56,39 @@ class PheromoneGrid:
         if 0 <= gx < self.grid_w and 0 <= gy < self.grid_h:
             return float(self.layers[layer_idx, gx, gy])
         return 0.0
+
+    def sense_forward(self, world_x, world_y, angle, layer_idx, dist=14.0, cone_angle=0.55):
+        """
+        Directional forward-cone pheromone sensor sampling ahead-left, ahead-center, ahead-right.
+        Prevents ants from turning backward towards pheromones they just deposited.
+        Returns: (steering_bias, max_intensity)
+          steering_bias: -cone_angle (steer left), 0.0 (straight), or +cone_angle (steer right)
+        """
+        # Ahead-left
+        al_x = world_x + math.cos(angle - cone_angle) * dist
+        al_y = world_y + math.sin(angle - cone_angle) * dist
+        v_left = self.sample(al_x, al_y, layer_idx)
+
+        # Ahead-center
+        ac_x = world_x + math.cos(angle) * dist
+        ac_y = world_y + math.sin(angle) * dist
+        v_center = self.sample(ac_x, ac_y, layer_idx)
+
+        # Ahead-right
+        ar_x = world_x + math.cos(angle + cone_angle) * dist
+        ar_y = world_y + math.sin(angle + cone_angle) * dist
+        v_right = self.sample(ar_x, ar_y, layer_idx)
+
+        max_val = max(v_left, v_center, v_right)
+        if max_val < 0.08:
+            return 0.0, 0.0
+
+        if v_center >= v_left and v_center >= v_right:
+            return 0.0, max_val
+        elif v_left > v_right:
+            return -cone_angle, max_val
+        else:
+            return cone_angle, max_val
 
     def get_gradient(self, world_x, world_y, layer_idx, sample_dist=8.0):
         """

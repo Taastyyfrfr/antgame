@@ -265,7 +265,7 @@ class Renderer:
         pygame.draw.line(surface, (30, 15, 10), (int(hx), int(hy)), (int(m1_x), int(m1_y)), 1)
         pygame.draw.line(surface, (30, 15, 10), (int(hx), int(hy)), (int(m2_x), int(m2_y)), 1)
 
-        # 5. Carried Cargo (Food crumb or Dirt pellet)
+        # 5. Carried Cargo (Food crumb, Dirt pellet, or Egg)
         if ant.cargo == 1: # FOOD
             cargo_x = hx + cos_a * (mand_len + 3)
             cargo_y = hy + sin_a * (mand_len + 3)
@@ -274,6 +274,10 @@ class Renderer:
             cargo_x = hx + cos_a * (mand_len + 3)
             cargo_y = hy + sin_a * (mand_len + 3)
             pygame.draw.circle(surface, (115, 78, 50), (int(cargo_x), int(cargo_y)), 3)
+        elif ant.cargo == 3: # EGG
+            cargo_x = hx + cos_a * (mand_len + 3)
+            cargo_y = hy + sin_a * (mand_len + 3)
+            pygame.draw.ellipse(surface, (245, 245, 240), (int(cargo_x - 2), int(cargo_y - 2), 4, 3))
 
         # Highlight ring if inspected/followed
         if followed:

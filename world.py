@@ -65,6 +65,7 @@ class World:
         self.falling_dirt = []  # list of [x, y, vx, vy]
         self.water_droplets = [] # list of [x, y, vx, vy]
         self.food_items = []    # list of FoodItem objects
+        self.surface_food_timer = 0.0
 
         # Generate world layers and starter colony
         self._generate_terrain()
@@ -166,6 +167,12 @@ class World:
         self.drop_food(pantry_x - 10, pantry_y + 4, amount=25, food_type="sugar")
         self.drop_food(pantry_x + 12, pantry_y + 4, amount=20, food_type="seed")
 
+        # Pre-seed natural surface food items (seeds and berries) along surface grass
+        for sx in (200, 390, 880, 1070):
+            sy = self.get_surface_y(sx) - 3
+            ft = "seed" if sx % 2 == 0 else "fruit"
+            self.drop_food(sx, sy, amount=random.randint(20, 35), food_type=ft)
+
     def carve_tunnel(self, x1, y1, x2, y2, radius=8):
         """Carves a continuous tubular tunnel between two points."""
         dist = math.hypot(x2 - x1, y2 - y1)
@@ -237,6 +244,14 @@ class World:
         if 0 <= col < self.cols and 0 <= row < self.rows:
             return self.grid[col, row] != CELL_AIR
         return True
+
+    def get_surface_y(self, px):
+        """Returns the y-coordinate of the highest solid ground pixel at horizontal position px."""
+        col = int(max(0, min(self.width - 1, px)) // self.cell_size)
+        for r in range(0, self.rows):
+            if self.grid[col, r] != CELL_AIR:
+                return r * self.cell_size
+        return SURFACE_Y
 
     def get_cell(self, px, py):
         col = int(px // self.cell_size)
@@ -389,6 +404,21 @@ class World:
 
         # Clean depleted food
         self.food_items = [f for f in self.food_items if f.amount > 0]
+
+        # 5. Natural surface food replenishment (fallen seeds / berries)
+        self.surface_food_timer += dt * 0.033
+        if self.surface_food_timer >= 22.0:
+            self.surface_food_timer = 0.0
+            surface_food_count = sum(1 for f in self.food_items if f.y <= SURFACE_Y + 15)
+            if surface_food_count < 6:
+                # Random location along grass (avoiding directly over the entrance crater 620-660)
+                spawn_x = random.choice([
+                    random.uniform(60, 580),
+                    random.uniform(700, self.width - 60)
+                ])
+                spawn_y = self.get_surface_y(spawn_x) - 4
+                food_type = "seed" if random.random() < 0.6 else "fruit"
+                self.drop_food(spawn_x, spawn_y, amount=random.randint(18, 30), food_type=food_type)
 
     def render_dirty_chunks(self):
         """Renders only dirty chunks onto their offscreen surfaces."""

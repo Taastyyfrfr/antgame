@@ -119,5 +119,42 @@ class TestAntColonySimulator(unittest.TestCase):
         # Soldier should have engaged and dealt damage
         self.assertLess(threat.hp, initial_hp)
 
+    def test_surface_ground_hugging_no_flying(self):
+        """Verify ants on surface are snapped to ground contour and never float into sky."""
+        ant = Ant(x=250, y=50, caste=CASTE_WORKER, colony=self.colony) # In the sky
+        self.colony.ants.append(ant)
+        
+        # Step movement
+        ant._step_movement(1.0, self.world)
+        
+        ground_y = self.world.get_surface_y(ant.x)
+        self.assertAlmostEqual(ant.y, ground_y - 2, delta=2.0)
+        self.assertGreaterEqual(ant.y, 120, "Ant must hug ground line and never float into sky")
+
+    def test_excavator_dig_streak(self):
+        """Verify excavators carve dig streaks through solid earth."""
+        # Find solid dirt near royal chamber
+        rx, ry = self.world.royal_chamber_pos
+        excavator = Ant(x=rx, y=ry, caste=CASTE_WORKER, colony=self.colony)
+        excavator.subrole = "Excavator"
+        excavator.dig_streak = 5
+        excavator.dig_angle = 0.0 # Dig rightward
+        
+        # Count solid cells to the right before digging
+        test_x = int(rx + 25)
+        test_y = int(ry)
+        
+        for _ in range(6):
+            excavator.update(1.0, self.world, self.pheromones, self.colony.spatial_hash, self.colony)
+            
+        # The excavator should have completed its streak and picked up dirt
+        self.assertEqual(excavator.dig_streak, 0)
+        self.assertEqual(excavator.cargo, 2) # CARGO_DIRT
+
+    def test_natural_surface_food_spawning(self):
+        """Verify natural seeds/berries spawn along surface grass."""
+        surface_foods = [f for f in self.world.food_items if f.y <= 145]
+        self.assertGreaterEqual(len(surface_foods), 3, "Initial surface food items should be present")
+
 if __name__ == "__main__":
     unittest.main()

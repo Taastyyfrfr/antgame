@@ -173,10 +173,10 @@ class UI:
         # Metrics rows
         lines = [
             f"Ants: {stats['total_ants']} (W:{stats['workers']} S:{stats['soldiers']} Q:1)",
+            f"Roles: {stats['foragers']} Foragers, {stats['excavators']} Diggers, {stats['nurses']} Nurses",
             f"Brood: {stats['eggs']} eggs, {stats['larvae']} larvae, {stats['pupae']} pupae",
             f"Food Stockpile: {stats['food']} units",
             f"Max Tunnel Depth: {stats['max_depth']} px",
-            f"Threats Detected: {stats['threats']}",
             f"Brush: {self.brush_radius}px (Scroll to resize)"
         ]
 
@@ -193,9 +193,10 @@ class UI:
             ins_surf.fill((30, 28, 38, 225))
             pygame.draw.rect(ins_surf, (240, 200, 100), (0, 0, 220, 95), 1, border_radius=6)
 
-            cargo_name = "Food Crumb" if ant.cargo == 1 else "Dirt Pellet" if ant.cargo == 2 else "None"
+            caste_desc = f"{ant.caste} ({ant.subrole})" if ant.caste == "Worker" else ant.caste
+            cargo_name = "Food Crumb" if ant.cargo == 1 else "Dirt Pellet" if ant.cargo == 2 else "Brood Egg" if ant.cargo == 3 else "None"
             ant_info = [
-                f"Ant ID: {id(ant) % 10000} ({ant.caste})",
+                f"Ant ID: {id(ant) % 10000} - {caste_desc}",
                 f"State: {ant.state}",
                 f"Health: {int(ant.health)}%  Energy: {int(ant.energy)}%",
                 f"Carrying: {cargo_name}"
