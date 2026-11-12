@@ -6,6 +6,7 @@ Implements 3-pixel border neighbor dirtying, moisture seepage, and starter chamb
 
 import math
 import random
+from collections import deque
 import numpy as np
 import pygame
 
@@ -67,10 +68,22 @@ class World:
         self.food_items = []    # list of FoodItem objects
         self.surface_food_timer = 0.0
 
+        # Navigation Flow Fields (Coarse 4x4 Grid: 320 x 180)
+        self.nav_scale = 4
+        self.nav_w = width // self.nav_scale
+        self.nav_h = height // self.nav_scale
+        self.dist_to_surface = np.full((self.nav_w, self.nav_h), 99999, dtype=np.int32)
+        self.dist_to_pantry = np.full((self.nav_w, self.nav_h), 99999, dtype=np.int32)
+        self.dist_to_nursery = np.full((self.nav_w, self.nav_h), 99999, dtype=np.int32)
+        self.dist_to_royal = np.full((self.nav_w, self.nav_h), 99999, dtype=np.int32)
+        self.nav_dirty = True
+        self.nav_timer = 0
+
         # Generate world layers and starter colony
         self._generate_terrain()
         self._carve_starter_colony()
         self.mark_all_chunks_dirty()
+        self.update_flow_fields(force=True)
 
     def _generate_terrain(self):
         """Generates cross-section subterranean layers with natural noise."""
@@ -253,6 +266,157 @@ class World:
                 return r * self.cell_size
         return SURFACE_Y
 
+    def update_flow_fields(self, force=False):
+        """
+        Recomputes subterranean flow fields across open tunnel cells using fast BFS.
+        Runs only when terrain is modified (dirty) or forced.
+        """
+        if not self.nav_dirty and not force:
+            return
+        self.nav_dirty = False
+
+        surf_gy = SURFACE_Y // self.nav_scale
+
+        # Build coarse open-cell mask for subterranean tunnels
+        open_mask = np.zeros((self.nav_w, self.nav_h), dtype=bool)
+        for gx in range(self.nav_w):
+            px = gx * self.nav_scale + 2
+            for gy in range(surf_gy, self.nav_h):
+                py = gy * self.nav_scale + 2
+                if not self.is_solid(px, py):
+                    open_mask[gx, gy] = True
+
+        # 1. Surface entrance flow field (target around x=640, y=130)
+        self._bfs_flow(open_mask, self.dist_to_surface, 160, surf_gy)
+
+        # 2. Food pantry flow field
+        px, py = self.food_storage_pos
+        self._bfs_flow(open_mask, self.dist_to_pantry, int(px // self.nav_scale), int(py // self.nav_scale))
+
+        # 3. Nursery flow field
+        nx, ny = self.nursery_chamber_pos
+        self._bfs_flow(open_mask, self.dist_to_nursery, int(nx // self.nav_scale), int(ny // self.nav_scale))
+
+        # 4. Royal chamber flow field
+        rx, ry = self.royal_chamber_pos
+        self._bfs_flow(open_mask, self.dist_to_royal, int(rx // self.nav_scale), int(ry // self.nav_scale))
+
+    def _bfs_flow(self, open_mask, dist_arr, target_gx, target_gy):
+        """Executes fast integer-distance BFS over open subterranean tunnel cells."""
+        dist_arr.fill(99999)
+        surf_gy = SURFACE_Y // self.nav_scale
+
+        target_gx = max(0, min(self.nav_w - 1, target_gx))
+        target_gy = max(surf_gy, min(self.nav_h - 1, target_gy))
+
+        # If designated target cell is solid, find closest open neighbor
+        if not open_mask[target_gx, target_gy]:
+            found = False
+            for r in range(1, 12):
+                for dx in range(-r, r + 1):
+                    for dy in range(-r, r + 1):
+                        gx, gy = target_gx + dx, target_gy + dy
+                        if 0 <= gx < self.nav_w and surf_gy <= gy < self.nav_h:
+                            if open_mask[gx, gy]:
+                                target_gx, target_gy = gx, gy
+                                found = True
+                                break
+                    if found:
+                        break
+                if found:
+                    break
+            if not found:
+                return
+
+        q = deque()
+        q.append((target_gx, target_gy))
+        dist_arr[target_gx, target_gy] = 0
+
+        dirs = ((1, 0), (-1, 0), (0, 1), (0, -1))
+        while q:
+            cx, cy = q.popleft()
+            cd = dist_arr[cx, cy] + 1
+            for dx, dy in dirs:
+                nx = cx + dx
+                ny = cy + dy
+                if 0 <= nx < self.nav_w and surf_gy <= ny < self.nav_h and open_mask[nx, ny]:
+                    if cd < dist_arr[nx, ny]:
+                        dist_arr[nx, ny] = cd
+                        q.append((nx, ny))
+
+    def get_flow_direction(self, px, py, target_name="surface"):
+        """
+        Looks at the 8 neighboring coarse cells around (px, py) in the chosen distance map
+        and returns a smooth unit steering vector (vx, vy, dist) toward the lowest-distance open neighbor.
+        Adds subtle organic wobble so ants form natural curving paths rather than rigid lines.
+        """
+        if target_name == "surface":
+            dist_map = self.dist_to_surface
+        elif target_name == "pantry":
+            dist_map = self.dist_to_pantry
+        elif target_name == "nursery":
+            dist_map = self.dist_to_nursery
+        else: # "royal"
+            dist_map = self.dist_to_royal
+
+        gx = int(px // self.nav_scale)
+        gy = int(py // self.nav_scale)
+
+        if not (0 <= gx < self.nav_w and 0 <= gy < self.nav_h):
+            return 0.0, -1.0, 99999
+
+        curr_d = dist_map[gx, gy]
+        if curr_d >= 99999:
+            # Point upward towards entrance
+            return 0.0, -1.0, 99999
+
+        best_d = curr_d
+        best_dx = 0
+        best_dy = 0
+
+        # Check 8 neighbors
+        for ndx, ndy in ((1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (-1, -1), (1, -1), (-1, 1)):
+            nx = gx + ndx
+            ny = gy + ndy
+            if 0 <= nx < self.nav_w and 0 <= ny < self.nav_h:
+                d = dist_map[nx, ny]
+                if d < best_d:
+                    best_d = d
+                    best_dx = ndx
+                    best_dy = ndy
+
+        if best_dx == 0 and best_dy == 0:
+            return 0.0, 0.0, curr_d
+
+        length = math.hypot(best_dx, best_dy)
+        vx = best_dx / length
+        vy = best_dy / length
+
+        # Organic wobble (-0.12 to +0.12 rad) so trails look natural
+        angle = math.atan2(vy, vx) + random.uniform(-0.11, 0.11)
+        return math.cos(angle), math.sin(angle), best_d
+
+    def get_expansion_target(self):
+        """Returns a coordinate (tx, ty) along chamber or tunnel perimeters for excavation."""
+        # 1. Deepen vertical main shaft if needed
+        shaft_x = self.width // 2
+        for test_y in range(460, self.height - 35, 10):
+            if self.is_solid(shaft_x, test_y) and self.get_cell(shaft_x, test_y) != 5: # not bedrock
+                return shaft_x + random.uniform(-6, 6), test_y
+
+        # 2. Expand side rooms (nursery or pantry or royal)
+        choice = random.choice([self.royal_chamber_pos, self.nursery_chamber_pos, self.food_storage_pos])
+        cx, cy = choice
+        angle = random.uniform(0, math.pi * 2)
+        dist = random.uniform(28, 48)
+        tx = cx + math.cos(angle) * dist
+        ty = cy + math.sin(angle) * dist
+        if self.is_solid(tx, ty) and self.get_cell(tx, ty) != 5:
+            return tx, ty
+
+        # Default dig site
+        return cx + random.uniform(-20, 20), cy + random.uniform(10, 25)
+
     def get_cell(self, px, py):
         col = int(px // self.cell_size)
         row = int(py // self.cell_size)
@@ -277,6 +441,7 @@ class World:
             if cell != CELL_AIR and cell != CELL_BEDROCK:
                 self.grid[col, row] = CELL_AIR
                 self.mark_chunk_dirty_at_pixel(px, py)
+                self.nav_dirty = True
                 if play_effects and random.random() < 0.2:
                     self.falling_dirt.append([px, py, random.uniform(-0.5, 0.5), random.uniform(0.5, 2.0)])
                 return True
@@ -290,6 +455,7 @@ class World:
             if self.grid[col, row] == CELL_AIR:
                 self.grid[col, row] = cell_type
                 self.mark_chunk_dirty_at_pixel(px, py)
+                self.nav_dirty = True
                 return True
         return False
 
@@ -419,6 +585,12 @@ class World:
                 spawn_y = self.get_surface_y(spawn_x) - 4
                 food_type = "seed" if random.random() < 0.6 else "fruit"
                 self.drop_food(spawn_x, spawn_y, amount=random.randint(18, 30), food_type=food_type)
+
+        # 6. Periodic Flow Field Updates (if terrain was modified)
+        self.nav_timer += 1
+        if self.nav_dirty and self.nav_timer >= 15:
+            self.update_flow_fields()
+            self.nav_timer = 0
 
     def render_dirty_chunks(self):
         """Renders only dirty chunks onto their offscreen surfaces."""

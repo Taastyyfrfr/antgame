@@ -247,8 +247,10 @@ class Renderer:
 
         # Dual Antennae
         ant_len = ant.length * 0.6
+        is_greeting = getattr(ant, 'greeting_timer', 0) > 0
         for ant_side in (-1, 1):
-            ant_angle = ang + (0.45 * ant_side) + math.sin(ant.walk_phase * 0.8 + ant_side) * 0.15
+            wiggle = math.sin(ant.walk_phase * 3.8 + ant_side) * 0.45 if is_greeting else math.sin(ant.walk_phase * 0.8 + ant_side) * 0.15
+            ant_angle = ang + (0.45 * ant_side) + wiggle
             ax_elbow = hx + math.cos(ant_angle) * (ant_len * 0.55)
             ay_elbow = hy + math.sin(ant_angle) * (ant_len * 0.55)
             ax_tip = ax_elbow + math.cos(ant_angle + 0.35 * ant_side) * (ant_len * 0.5)

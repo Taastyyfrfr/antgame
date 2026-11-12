@@ -156,5 +156,19 @@ class TestAntColonySimulator(unittest.TestCase):
         surface_foods = [f for f in self.world.food_items if f.y <= 145]
         self.assertGreaterEqual(len(surface_foods), 3, "Initial surface food items should be present")
 
+    def test_flow_field_navigation(self):
+        """Verify coarse-grid flow fields guide ants through tunnels without penetrating walls."""
+        # Test point in lower main shaft (x=640, y=360)
+        vx, vy, dist = self.world.get_flow_direction(640, 360, "surface")
+        self.assertLess(dist, 99999, "Cell in main shaft must be reached by surface flow field")
+        # To get to surface from (640, 360), vector must steer upward (vy < 0)
+        self.assertLess(vy, 0.0, "Surface flow field in vertical shaft must point upwards toward entrance")
+
+        # Test point near entrance heading to pantry (x=640, y=180)
+        pvx, pvy, pdist = self.world.get_flow_direction(640, 180, "pantry")
+        self.assertLess(pdist, 99999)
+        # To get to pantry from upper shaft, vector must steer downward (pvy > 0)
+        self.assertGreater(pvy, 0.0, "Pantry flow field in upper shaft must point downwards")
+
 if __name__ == "__main__":
     unittest.main()
